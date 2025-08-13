@@ -41,6 +41,11 @@ class TradingGUI:
         self.ws_symbol_var = tk.StringVar(value="BTCUSDT")
         self.ws_status_var = tk.StringVar(value="Disconnected")
 
+        # Risk/position management state
+        self._pnl_peaks = {}
+        self.active_positions_count = 0
+        self.high_vol_var = tk.BooleanVar(value=False)
+
         # Ensure WS closes on exit
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
@@ -168,6 +173,11 @@ class TradingGUI:
                 self.ws_enabled = False
                 self.stop_websocket()
             toggle_var.set(self.ws_enabled)
+        # High Volatility toggle (affects trailing buffer)
+        hv_frame = ttk.Frame(frame, style="Crypto.Surface.TFrame")
+        hv_frame.pack(pady=SPACE)
+        ttk.Checkbutton(hv_frame, text="High Volatility Mode (wider trailing)", variable=self.high_vol_var).pack()
+
 
         ttk.Checkbutton(frame, text="Enable WebSocket Signals", variable=toggle_var, command=on_toggle).pack(pady=SPACE)
 
@@ -310,6 +320,10 @@ class TradingGUI:
 
         direction = 'up' if data.get('delta', 0) > 0 else 'down'
         try:
+            # Enforce max concurrent positions (4)
+            if self.active_positions_count >= 4:
+                self.update_status("Max positions reached - Signal ignored", COLORS["negative"])
+                return
             wager = float(self.wager_var.get())
             multiplier = float(self.multiplier_var.get())
             success = self.trading.execute_trade(direction, wager, multiplier)
@@ -325,6 +339,9 @@ class TradingGUI:
 
     def place_up_bet(self):
         try:
+            if self.active_positions_count >= 4:
+                self.update_status("Max positions reached - Trade blocked", COLORS["negative"])
+                return
             self.update_status("🔄 Placing UP bet...", '#ffaa00')
             wager = float(self.wager_var.get())
             multiplier = float(self.multiplier_var.get())
@@ -346,6 +363,9 @@ class TradingGUI:
 
     def place_down_bet(self):
         try:
+            if self.active_positions_count >= 4:
+                self.update_status("Max positions reached - Trade blocked", COLORS["negative"])
+                return
             self.update_status("🔄 Placing DOWN bet...", '#ffaa00')
             wager = float(self.wager_var.get())
             multiplier = float(self.multiplier_var.get())
@@ -434,6 +454,59 @@ class TradingGUI:
                         bet['current_price'],
                         pnl_disp,
                     ), tags=row_tags)
+                # Risk rules: update counters and apply stop-loss / trailing
+                self.active_positions_count = len(active_bets)
+                # Disable buttons if at limit
+                try:
+                    limit_reached = self.active_positions_count >= 4
+                    for child in self.root.winfo_children():
+                        # heuristic: disable main buy/sell buttons by text
+                        if isinstance(child, ttk.Labelframe):
+                            for btn in child.winfo_children():
+                                if isinstance(btn, ttk.Button) and btn.cget('text') in ("BUY (UP)", "SELL (DOWN)"):
+                                    btn.state(['disabled'] if limit_reached else ['!disabled'])
+                except Exception:
+                    pass
+
+                # Stop loss and trailing
+                buffer = 0.03 if self.high_vol_var.get() else 0.02
+                for idx, bet in enumerate(active_bets):
+                    key = bet.get('row_index', idx)
+                    pnl = float(bet.get('pnl') or 0)
+                    # Initialize peak at current pnl
+                    peak = self._pnl_peaks.get(key, pnl)
+                    if pnl > peak:
+                        peak = pnl
+                    self._pnl_peaks[key] = peak
+                    # Immediate tiny stop-loss around zero to avoid degenerate losers
+                    if pnl <= -0.01:
+                        self.update_status(f"Stop loss hit on position {key} (pnl {pnl:.4f})", COLORS["negative"])
+                        try:
+                            # Attempt per-position close; fallback to global
+                            if hasattr(self.trading, 'close_trade'):
+                                self.trading.close_trade(int(key))
+                            else:
+                                self.trading.close_all_trades()
+                        except Exception:
+                            try:
+                                self.trading.close_all_trades()
+                            except Exception:
+                                pass
+                        continue
+                    # Trailing profit lock
+                    if peak >= 0.01 and pnl < (peak - buffer):
+                        self.update_status(f"Trailing stop: lock profit on {key} (peak {peak:.4f} -> pnl {pnl:.4f})", COLORS["positive"])
+                        try:
+                            if hasattr(self.trading, 'close_trade'):
+                                self.trading.close_trade(int(key))
+                            else:
+                                self.trading.close_all_trades()
+                        except Exception:
+                            try:
+                                self.trading.close_all_trades()
+                            except Exception:
+                                pass
+
                 self.update_status(f"ACTIVE • {len(active_bets)} position(s)", COLORS["accent_green"])
             else:
                 self.update_status("READY • Awaiting webhook", COLORS["accent_green"])
